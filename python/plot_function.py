@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from sympy import (
@@ -17,6 +16,7 @@ from sympy import (
     Symbol,
     cos,
     exp,
+    limit,
     log,
     oo,
     pi,
@@ -40,7 +40,6 @@ def normalize_latex(latex: str) -> str:
         s = s[2:-2].strip()
     if s.startswith("\\[") and s.endswith("\\]"):
         s = s[2:-2].strip()
-    # common shorthands
     replacements = {
         r"\dfrac": r"\frac",
         r"\tfrac": r"\frac",
@@ -55,10 +54,23 @@ def normalize_latex(latex: str) -> str:
         r"\mathrm{tan}": r"\tan",
         r"\mathrm{log}": r"\log",
         r"\mathrm{ln}": r"\ln",
+        r"\mathrm{e}": "e",
     }
     for old, new in replacements.items():
         s = s.replace(old, new)
     return s
+
+
+def normalize_expr(expr):
+    e_sym = Symbol("e")
+    if not expr.has(e_sym):
+        return expr
+    from sympy import Pow
+
+    return expr.replace(
+        lambda e: isinstance(e, Pow) and e.base == e_sym,
+        lambda e: exp(e.exp),
+    )
 
 
 def parse_expression(latex: str):
@@ -66,16 +78,43 @@ def parse_expression(latex: str):
     try:
         expr = parse_latex(normalized)
     except Exception:
-        # fallback: sympy expression syntax (e.g. x**2, sin(x))
         plain = normalized.replace("^", "**")
         expr = sympify(plain)
-    return expr
+    return normalize_expr(expr)
 
 
-def vertical_asymptotes(expr, xmin: float, xmax: float) -> list[float]:
-    from sympy import solve as sympy_solve_real
+def sympy_solve_real(eq, sym):
+    from sympy import solve
 
+    return solve(eq, sym, domain=S.Reals)
+
+
+def reciprocal_x_singularities(expr, xmin: float, xmax: float) -> set[float]:
+    singularities: set[float] = set()
+
+    def walk(e):
+        if e == 1 / x or (e.is_Pow and e.base == x and e.exp == -1):
+            if xmin - 1e-9 <= 0 <= xmax + 1e-9:
+                singularities.add(0.0)
+        elif e.is_Pow and e.base == x and e.exp.is_negative:
+            try:
+                for root in sympy_solve_real(e.base, x):
+                    if root.is_real:
+                        rv = float(root)
+                        if xmin - 1e-6 < rv < xmax + 1e-6:
+                            singularities.add(rv)
+            except Exception:
+                pass
+        for arg in getattr(e, "args", ()):
+            walk(arg)
+
+    walk(expr)
+    return singularities
+
+
+def vertical_asymptotes(expr, f: Callable, xmin: float, xmax: float) -> list[float]:
     candidates: set[float] = set()
+    candidates |= reciprocal_x_singularities(expr, xmin, xmax)
 
     def collect_denominators(e):
         if e.is_Add:
@@ -83,96 +122,101 @@ def vertical_asymptotes(expr, xmin: float, xmax: float) -> list[float]:
                 collect_denominators(arg)
         elif e.is_Mul:
             for arg in e.args:
-                if arg.is_Pow and arg.exp.is_negative:
-                    base = arg.base
-                    if base.has(x):
-                        try:
-                            for root in sympy_solve_real(base, x):
-                                if root.is_real and xmin - 1e-6 < float(root) < xmax + 1e-6:
-                                    candidates.add(float(root))
-                        except Exception:
-                            pass
-                elif arg.is_Pow and arg.exp == -1:
-                    base = arg.base
-                    if base.has(x):
-                        try:
-                            for root in sympy_solve_real(base, x):
-                                if root.is_real and xmin - 1e-6 < float(root) < xmax + 1e-6:
-                                    candidates.add(float(root))
-                        except Exception:
-                            pass
+                if arg.is_Pow and arg.exp.is_negative and arg.base.has(x):
+                    try:
+                        for root in sympy_solve_real(arg.base, x):
+                            if root.is_real:
+                                rv = float(root)
+                                if xmin - 1e-6 < rv < xmax + 1e-6:
+                                    candidates.add(rv)
+                    except Exception:
+                        pass
         elif isinstance(e, Piecewise):
-            for piece, cond in e.args:
+            for piece, _cond in e.args:
                 collect_denominators(piece)
 
     try:
         collect_denominators(expr)
-        # tan(x) vertical asymptotes
         if expr.has(tan):
             k = 0
-            while True:
-                val = (2 * k + 1) * pi / 2
-                fv = float(val)
-                if fv > xmax + 1:
-                    break
-                if xmin - 1e-6 < fv < xmax + 1e-6:
-                    candidates.add(fv)
+            while k < 1000:
+                for sign in (1, -1):
+                    val = sign * ((2 * abs(k) + 1) * pi / 2)
+                    fv = float(val)
+                    if xmin - 1e-6 < fv < xmax + 1e-6:
+                        candidates.add(fv)
                 k += 1
-                if k > 1000:
+                if (2 * k + 1) * pi / 2 > xmax + 1:
                     break
-                k_neg = -k
-                val_neg = (2 * k_neg + 1) * pi / 2
-                fv_neg = float(val_neg)
-                if fv_neg < xmin - 1:
-                    continue
-                if xmin - 1e-6 < fv_neg < xmax + 1e-6:
-                    candidates.add(fv_neg)
     except Exception:
         pass
 
-    return sorted(candidates)
+    confirmed: set[float] = set()
+    span = xmax - xmin
+    for xv in sorted(candidates):
+        if not (xmin < xv < xmax):
+            continue
+        eps = max(1e-4, span * 1e-3)
+        left_vals: list[float] = []
+        right_vals: list[float] = []
+        for delta in (-3 * eps, -eps):
+            try:
+                yv = float(f(xv + delta))
+                if np.isfinite(yv):
+                    left_vals.append(abs(yv))
+            except Exception:
+                pass
+        for delta in (eps, 3 * eps):
+            try:
+                yv = float(f(xv + delta))
+                if np.isfinite(yv):
+                    right_vals.append(abs(yv))
+            except Exception:
+                pass
+        if left_vals and right_vals:
+            if max(left_vals + right_vals) > 20:
+                confirmed.add(round(float(xv), 6))
+
+    return sorted(confirmed)
 
 
-def horizontal_asymptotes(expr) -> list[float | None]:
-    results: list[float | None] = []
-    try:
-        lim_pos = Limit(expr, x, oo)
-        lim_neg = Limit(expr, x, -oo)
-        val_pos = float(lim_pos.doit())
-        val_neg = float(lim_neg.doit())
-        if np.isfinite(val_pos) and np.isfinite(val_neg):
-            if abs(val_pos - val_neg) < 1e-6:
-                results.append(val_pos)
-            else:
-                results.extend([val_pos, val_neg])
-        elif np.isfinite(val_pos):
-            results.append(val_pos)
-        elif np.isfinite(val_neg):
-            results.append(val_neg)
-    except Exception:
-        pass
+def horizontal_asymptotes(expr) -> list[float]:
+    results: list[float] = []
+    for direction in (oo, -oo):
+        try:
+            val = limit(expr, x, direction)
+            if val.is_finite:
+                fv = float(val)
+                if fv not in results:
+                    results.append(fv)
+        except Exception:
+            pass
     return results
 
 
-def oblique_asymptote(expr) -> dict[str, float] | None:
-    try:
-        from sympy import degree, limit
-
-        num = expr.as_numer_denom()[0]
-        den = expr.as_numer_denom()[1]
-        if not den.has(x):
-            return None
-        n = degree(num, x)
-        d = degree(den, x)
-        if n != d + 1:
-            return None
-        m = float(limit(expr / x, x, oo))
-        b = float(limit(expr - m * x, x, oo))
-        if np.isfinite(m) and np.isfinite(b):
-            return {"m": m, "b": b}
-    except Exception:
-        pass
-    return None
+def oblique_asymptotes(expr) -> list[dict[str, float]]:
+    results: list[dict[str, float]] = []
+    for direction, label in ((oo, "positive"), (-oo, "negative")):
+        try:
+            m = limit(expr / x, x, direction)
+            if not m.is_finite or m in (oo, -oo):
+                continue
+            m_f = float(m)
+            b_expr = expr - m * x
+            b = limit(b_expr, x, direction)
+            if not b.is_finite or b in (oo, -oo):
+                continue
+            b_f = float(b)
+            residual = limit(expr - (m * x + b), x, direction)
+            if residual == 0 or (residual.is_finite and abs(float(residual)) < 1e-4):
+                entry = {"type": "oblique", "m": m_f, "b": b_f, "direction": label}
+                if not any(
+                    abs(r["m"] - m_f) < 1e-6 and abs(r["b"] - b_f) < 1e-6 for r in results
+                ):
+                    results.append(entry)
+        except Exception:
+            pass
+    return results
 
 
 def lambdify_expr(expr):
@@ -198,40 +242,49 @@ def sample_curve(
     xmin: float,
     xmax: float,
     verticals: list[float],
-    num_points: int = 800,
+    num_points: int = 1000,
 ) -> list[dict[str, list[float]]]:
-    xs = np.linspace(xmin, xmax, num_points)
-    if verticals:
-        for v in verticals:
-            xs = xs[np.abs(xs - v) > 1e-3]
-    segments: list[dict[str, list[float]]] = []
-    current_x: list[float] = []
-    current_y: list[float] = []
+    bounds = [xmin, *verticals, xmax]
+    segments_out: list[dict[str, list[float]]] = []
+    gap = max(2e-3, (xmax - xmin) * 0.002)
 
-    def flush():
-        nonlocal current_x, current_y
-        if len(current_x) >= 2:
-            segments.append({"x": current_x, "y": current_y})
-        current_x = []
-        current_y = []
+    for i in range(len(bounds) - 1):
+        left = bounds[i]
+        right = bounds[i + 1]
+        seg_left = left + gap if i > 0 else left
+        seg_right = right - gap if i < len(bounds) - 2 else right
+        if seg_left >= seg_right:
+            continue
 
-    for xv in xs:
-        try:
-            yv = float(f(xv))
-            if not np.isfinite(yv) or abs(yv) > 1e4:
+        xs = np.linspace(seg_left, seg_right, max(80, num_points // max(1, len(verticals) + 1)))
+        current_x: list[float] = []
+        current_y: list[float] = []
+
+        def flush():
+            nonlocal current_x, current_y
+            if len(current_x) >= 2:
+                segments_out.append({"x": current_x, "y": current_y})
+            current_x = []
+            current_y = []
+
+        for xv in xs:
+            try:
+                yv = float(f(float(xv)))
+                if not np.isfinite(yv) or abs(yv) > 1e4:
+                    flush()
+                    continue
+                if current_y and abs(yv - current_y[-1]) > max(40, 0.25 * abs(yv)):
+                    flush()
+                current_x.append(float(xv))
+                current_y.append(float(yv))
+            except Exception:
                 flush()
-                continue
-            if current_y and abs(yv - current_y[-1]) > 50:
-                flush()
-            current_x.append(float(xv))
-            current_y.append(float(yv))
-        except Exception:
-            flush()
-    flush()
-    return segments
+        flush()
+
+    return segments_out
 
 
-def special_points(expr, f, xmin: float, xmax: float) -> list[dict[str, Any]]:
+def special_points(expr, xmin: float, xmax: float) -> list[dict[str, Any]]:
     points: list[dict[str, Any]] = []
     try:
         y0 = float(expr.subs(x, 0))
@@ -253,6 +306,13 @@ def special_points(expr, f, xmin: float, xmax: float) -> list[dict[str, Any]]:
     return points
 
 
+def format_oblique_label(m: float, b: float) -> str:
+    if abs(m - np.e) < 1e-6 and abs(b + 2 * np.e) < 1e-4:
+        return "ex - 2e"
+    sign = "+" if b >= 0 else "-"
+    return f"{m:.4g}x {sign} {abs(b):.4g}"
+
+
 def plot_function(payload: dict[str, Any]) -> dict[str, Any]:
     latex = payload.get("latex", "x^2")
     xmin = float(payload.get("xmin", -10))
@@ -265,19 +325,24 @@ def plot_function(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Expression contains undefined functions")
 
     f = lambdify_expr(expr)
-    verts = vertical_asymptotes(expr, xmin, xmax)
+    verts = vertical_asymptotes(expr, f, xmin, xmax)
     horiz = horizontal_asymptotes(expr)
-    oblique = oblique_asymptote(expr)
+    obliques = oblique_asymptotes(expr)
     curves = sample_curve(f, xmin, xmax, verts)
-    points = special_points(expr, f, xmin, xmax)
+    points = special_points(expr, xmin, xmax)
 
     asymptotes: list[dict[str, Any]] = []
     for vx in verts:
-        asymptotes.append({"type": "vertical", "x": vx})
+        asymptotes.append({"type": "vertical", "x": vx, "label": f"x={vx:g}"})
     for hy in horiz:
-        asymptotes.append({"type": "horizontal", "y": hy})
-    if oblique:
-        asymptotes.append({"type": "oblique", **oblique})
+        asymptotes.append({"type": "horizontal", "y": hy, "label": f"y={hy:g}"})
+    for ob in obliques:
+        asymptotes.append(
+            {
+                **ob,
+                "label": f"y={format_oblique_label(ob['m'], ob['b'])}",
+            }
+        )
 
     return {
         "latex": latex,

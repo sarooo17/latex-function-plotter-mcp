@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import {
   RESOURCE_MIME_TYPE,
   registerAppResource,
-  registerAppTool,
 } from "@modelcontextprotocol/ext-apps/server";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -66,8 +65,7 @@ function createPlotServer(): McpServer {
     })
   );
 
-  registerAppTool(
-    server,
+  server.registerTool(
     "plot_latex_function",
     {
       title: "Grafico funzione LaTeX",
@@ -88,6 +86,19 @@ function createPlotServer(): McpServer {
           .optional()
           .describe("Estremo destro del dominio (default 10)"),
       },
+      outputSchema: {
+        plot: z.object({
+          latex: z.string(),
+          expression: z.string(),
+          domain: z.tuple([z.number(), z.number()]),
+          curves: z.array(
+            z.object({ x: z.array(z.number()), y: z.array(z.number()) })
+          ),
+          asymptotes: z.array(z.record(z.unknown())),
+          specialPoints: z.array(z.record(z.unknown())),
+        }),
+        summary: z.string(),
+      },
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -103,12 +114,18 @@ function createPlotServer(): McpServer {
     async ({ latex, xmin, xmax }) => {
       const plot = await plotLatexFunction({ latex, xmin, xmax });
       const asymptoteCount = plot.asymptotes.length;
-      const summary = `Grafico di f(x)=${latex} su [${plot.domain[0]}, ${plot.domain[1]}]. Espressione: ${plot.expression}. Asintoti: ${asymptoteCount}. Punti notevoli: ${plot.specialPoints.length}.`;
+      const asymptoteLabels = plot.asymptotes
+        .map((a) => ("label" in a ? String(a.label) : a.type))
+        .join(", ");
+      const summary = `Grafico di f(x)=${latex} su [${plot.domain[0]}, ${plot.domain[1]}]. Espressione: ${plot.expression}. Asintoti (${asymptoteCount}): ${asymptoteLabels || "nessuno"}. Punti notevoli: ${plot.specialPoints.length}.`;
 
       return {
         structuredContent: { plot, summary },
-        content: [{ type: "text", text: summary }],
-        _meta: { plot },
+        content: [
+          { type: "text", text: summary },
+          { type: "text", text: JSON.stringify({ plot }) },
+        ],
+        _meta: { plot, ui: { resourceUri: WIDGET_URI } },
       };
     }
   );

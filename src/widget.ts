@@ -1,4 +1,4 @@
-export const WIDGET_URI = "ui://widget/function-plot-v1.html";
+export const WIDGET_URI = "ui://widget/function-plot-v2.html";
 
 export const WIDGET_HTML = `<!DOCTYPE html>
 <html lang="it">
@@ -111,6 +111,21 @@ export const WIDGET_HTML = `<!DOCTYPE html>
             x1, y1: a.m * x1 + a.b,
             line: { color: '#c77dff', width: 2, dash: 'dot' }
           });
+          annotations.push({
+            x: x1, y: a.m * x1 + a.b, xref: 'x', yref: 'y',
+            text: 'y=' + Number(a.m).toFixed(3) + 'x' + (a.b >= 0 ? '+' : '') + Number(a.b).toFixed(3),
+            showarrow: false, xanchor: 'left',
+            font: { color: '#d9b3ff', size: 11 }
+          });
+        }
+        if (a.type === 'curved' && a.expression) {
+          annotations.push({
+            x: 0.02, y: 0.98 - (annotations.length * 0.06),
+            xref: 'paper', yref: 'paper',
+            text: 'asintoto: y=' + a.expression,
+            showarrow: false, xanchor: 'left',
+            font: { color: '#d9b3ff', size: 11 }
+          });
         }
       }
 
@@ -152,10 +167,37 @@ export const WIDGET_HTML = `<!DOCTYPE html>
       }, { responsive: true, displayModeBar: false });
     }
 
+    function extractPlot(toolResult) {
+      if (!toolResult) return null;
+      const sc = toolResult.structuredContent;
+      if (sc?.plot) return sc.plot;
+      if (sc?.curves) return sc;
+      if (toolResult._meta?.plot) return toolResult._meta.plot;
+      if (toolResult.plot) return toolResult.plot;
+      const blocks = toolResult.content;
+      if (Array.isArray(blocks)) {
+        for (const block of blocks) {
+          if (block?.type !== 'text' || !block.text) continue;
+          try {
+            const parsed = JSON.parse(block.text);
+            if (parsed?.plot) return parsed.plot;
+            if (parsed?.curves) return parsed;
+          } catch (_) {}
+        }
+      }
+      return null;
+    }
+
     function handleToolResult(message) {
       const params = message?.params ?? message;
-      const structured = params?.structuredContent ?? params?.result?.structuredContent ?? params;
-      if (structured?.plot) renderPlot(structured.plot);
+      renderPlot(extractPlot(params));
+    }
+
+    function bootstrapFromHost() {
+      const globals = window.openai;
+      if (!globals) return;
+      const initial = extractPlot(globals.toolOutput) || extractPlot({ plot: globals.toolOutput });
+      if (initial) renderPlot(initial);
     }
 
     window.addEventListener('message', (event) => {
@@ -165,7 +207,21 @@ export const WIDGET_HTML = `<!DOCTYPE html>
       if (message.method === 'ui/notifications/tool-result') {
         handleToolResult(message);
       }
+      if (message.method === 'ui/notifications/tool-input') {
+        const latex = message.params?.latex || message.params?.arguments?.latex;
+        if (latex) subtitleEl.textContent = 'Calcolo: f(x) = ' + latex;
+      }
     }, { passive: true });
+
+    window.addEventListener('openai:set_globals', (event) => {
+      const toolOutput = event.detail?.globals?.toolOutput ?? window.openai?.toolOutput;
+      const plot = extractPlot(toolOutput) || extractPlot({ plot: toolOutput });
+      if (plot) renderPlot(plot);
+    }, { passive: true });
+
+    bootstrapFromHost();
+    setTimeout(bootstrapFromHost, 0);
+    setTimeout(bootstrapFromHost, 250);
   </script>
 </body>
 </html>`;
